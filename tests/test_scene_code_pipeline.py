@@ -1,0 +1,429 @@
+"""Real portrait renders with deterministic fake planning/code/review providers."""
+import copy
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+import pytest
+from src.scene_design import scene_code_pipeline as pipeline, scene_theme, scene_generation as sg
+from src.scene_design.render import _settings
+from src.scene_design.scene_telemetry import select_frames
+from src.shared import _workflow_store as store
+from src.shared.ai_config import get_model
+from src.shared.job_session import Session
+from tests.ai_support import FakeCodex
+from tests.scene_v2_support import VisionRouter, story
+
+SOURCE = """from manim import *
+from manim_kit import vn_text, track, finish_scene
+class GeneratedScene(Scene):
+    def construct(self):
+        self.camera.background_color = '#0D1726'
+        title = track(self, 'title', vn_text('Chuyển động', 28).move_to([0,5,0]), kind='text',layout_role='hud')
+        point = track(self, 'point', Dot([-1,0,0], color='#56DFC5'), kind='shape',layout_role='focal')
+        self.add(title, point)
+        self.play(point.animate.shift(2*RIGHT), run_time=2, rate_func=linear)
+        finish_scene(self, 3)
+"""
+
+
+def visual_plan():
+    plan=story(narration='Một điểm chuyển động từ trái sang phải.')
+    plan['beats'][0].update(show='Một điểm và tiêu đề.',motion='Điểm di chuyển sang phải.',
+        understand='Theo dõi chuyển động.',criteria=['Điểm di chuyển sang phải và luôn nằm trong vùng an toàn.'],
+        required_capabilities=['Dot','Text'])
+    plan.update(objects=[dict(id='title',role='text'),dict(id='point',role='shape')],
+        recipe_ids=['explanatory_motion'],required_apis=['Dot','Text'])
+    from tests.system_contract_support import bind_plan
+    return bind_plan(plan,hud_ids=['title'])
+
+
+class CodeRouter(FakeCodex):
+    def __init__(self, sources=None, plan=None):
+        super().__init__();self.sources=sources or [SOURCE];self.code_count=0;self.plan=plan
+    def complete(self,payload):
+        self.requests.append(copy.deepcopy(payload))
+        props=payload['schema']['properties']
+        if 'summary' in props:
+            context=json.loads(payload['messages'][1]['content'])
+            sid=next(iter(context['snapshot']['scenes']))
+            result=dict(summary='Sửa mã cảnh.',categories=['code'],scenes=[sid],resources=[],resource_updates=[],outside_scope=False)
+        elif 'beats' in props:
+            result=copy.deepcopy(self.plan or visual_plan())
+        elif 'source' in props:
+            result=dict(source=self.sources[min(self.code_count,len(self.sources)-1)],requires_design_change=False,reason='')
+            self.code_count+=1
+        else:
+            raise AssertionError(props)
+        return dict(id='direct-'+str(len(self.requests)),model=get_model(),
+            usage=dict(billing_source='codex_subscription',prompt_tokens=100,completion_tokens=100,cost=None),
+            choices=[dict(finish_reason='stop',message=dict(content=json.dumps(result,ensure_ascii=False)))])
+
+
+def run_pipeline(root, router=None, repairs=2):
+    router=router or CodeRouter();vision=VisionRouter()
+    directory=root/'generation'/'direct';directory.mkdir(parents=True)
+    job=dict(job_id='direct',input=dict(stage='scene_design',max_repairs=repairs),calls=[],status='working',pricing=router.preflight())
+    session=Session(directory,job,router,None,budget_usd=.5,other_used=0)
+    context=dict(scene=dict(scene_id='scene_1',narration=visual_plan()['narration']),
+        target_seconds=3,config=copy.deepcopy(sg.DEFAULT_CONFIG),script={},brief={})
+    with patch('src.scene_design.scene_vision.CLIENT_FACTORY',return_value=vision), \
+         patch('src.scene_design.scene_vision.review_model',return_value=vision.model), \
+         patch('src.scene_design.scene_generation.repair_limit',return_value=repairs):
+        result=pipeline.generate(root,directory,session,context)
+    return result,session,context,vision
+
+
+def test_preview_and_final_have_identical_logical_camera():
+    a,_=_settings(scene_theme.render_profile(sg.DEFAULT_CONFIG['render']))
+    b,_=_settings(scene_theme.render_profile(sg.DEFAULT_CONFIG['render'],final=True))
+    assert (a['frame_width'],a['frame_height'])==(9,16)==(b['frame_width'],b['frame_height'])
+    assert a['frame_rate']==b['frame_rate']==30
+    assert b['pixel_width']==a['pixel_width']*3
+    assert b['pixel_height']==a['pixel_height']*3
+
+
+def test_frame_budget_prioritizes_actual_collision():
+    telemetry=dict(fps=30,issues=[dict(time=1.2,problem='Rendered text bounding boxes overlap')],
+        events=[dict(middle_frame=15,end_frame=29),dict(middle_frame=44,end_frame=59)])
+    frames=select_frames(telemetry,90)
+    assert len(frames)<=5
+    assert {0,36,89}<=set(frames)
+
+
+def test_real_direct_pipeline_and_native_final(tmp_path):
+    (path,extra),session,context,vision=run_pipeline(tmp_path)
+    assert extra['design_pipeline']==3 and extra['quality_passed']
+    ref=extra['manim_render']
+    assert (ref['video']['width'],ref['video']['height'],ref['video']['fps'])==(360,640,30)
+    assert 'layout_telemetry' not in ref['video']
+    work=path.parent/'round_00'
+    telemetry=store.read_json(work/'layout_telemetry.json')
+    assert telemetry['checked_frames']>=89
+    assert telemetry['events'][0]['end_frame']>=58
+    assert telemetry['early_motion']
+    assert telemetry['object_ids']==['point','title']
+    evidence=store.read_json(work/'evidence.json')
+    assert evidence['sampling']['complete']
+    assert len(evidence['frames']) > 5
+    assert evidence['binding']['sha256']
+    assert len(vision.requests)==1
+    review_payload=json.loads(vision.requests[0]['messages'][1]['content'][0]['text'])
+    assert review_payload['render_checks']['duration_tolerance_seconds']==pytest.approx(2/30)
+    assert 'sub-frame' in vision.requests[0]['messages'][0]['content']
+    artifact=dict(extra,path=str(path.relative_to(tmp_path)),sha256=store.digest(path))
+    output=pipeline.render_final(tmp_path,artifact,context['config'])
+    assert output['status']=='success',output
+    meta=store.read_json(Path(output['log_path']).with_suffix('.json'))
+    assert (meta['video']['width'],meta['video']['height'],meta['video']['fps'])==(1080,1920,30)
+    assert meta['render_config']['resolution']==[1080,1920]
+    assert meta['scene_file']==str(tmp_path/ref['code_path'])
+    # Native evidence must use the real native render metadata, never an upscale.
+    native_ref=copy.deepcopy(ref)
+    native_ref.update(path=str(Path(output['video_path']).relative_to(tmp_path)),
+        sha256=store.digest(Path(output['video_path'])),version=meta['version'],
+        metadata_path=str(Path(output['log_path']).with_suffix('.json').relative_to(tmp_path)),
+        metadata_sha256=store.digest(Path(output['log_path']).with_suffix('.json')),
+        video={key:value for key,value in meta['video'].items() if key!='layout_telemetry'})
+    native_work=path.parent/'native_evidence';native_work.mkdir()
+    native_design=store.read_json(path)
+    native_design['evidence_requirements']=[dict(beat_id=row['beat_id'],criterion=row['criterion'],source='native')
+        for row in native_design['layout_plan']['criterion_rules']]
+    _,native_checks,native_manifest=pipeline.evidence(tmp_path,native_work,native_ref,
+        native_design,native_design['layout_plan'])
+    assert native_manifest['source_kind']=='native_test'
+    assert native_manifest['sampling']['complete']
+    from src.scene_design import contract_review
+    contract_review.messages(tmp_path,native_design['layout_plan'],native_design,native_manifest,native_checks)
+
+    # Final evidence is validated without changing reviewed source or its hash.
+    assert store.digest(tmp_path/ref['code_path'])==ref['code_sha256']
+    before=len(session.job['calls'])
+    with patch('src.scene_design.scene_vision.CLIENT_FACTORY',side_effect=AssertionError('No new call on replay')):
+        assert pipeline.generate(tmp_path,path.parent,session,context)[0]==path
+    assert len(session.job['calls'])==before
+    # Old caches without a metadata anchor get a local render of the same source.
+    saved=store.read_json(work/'code_render.json')
+    saved['reference'].pop('metadata_sha256')
+    store.atomic_write(work/'code_render.json',saved)
+    old_hash=ref['sha256']
+    refreshed=pipeline.render_code(tmp_path,work,session,store.read_json(path),
+        (work/'scene.py').read_text(),context['config'])
+    assert refreshed['version']!=ref['version']
+    assert refreshed['code_sha256']==ref['code_sha256']
+    assert refreshed['metadata_sha256']==store.digest(tmp_path/refreshed['metadata_path'])
+    assert store.digest(tmp_path/ref['path'])==old_hash
+    assert len(session.job['calls'])==before
+
+
+
+def test_layout_feedback_repairs_code_without_replanning(tmp_path):
+    bad=SOURCE.replace('.move_to([0,5,0])','.move_to([4.4,5,0])')
+    router=CodeRouter([bad,SOURCE])
+    (path,extra),session,context,vision=run_pipeline(tmp_path,router)
+    phases=[c['phase'] for c in session.job['calls']]
+    assert phases.count('v3_plan_0')==1 and 'v3_plan_1' not in phases
+    assert 'v3_code_1' in phases
+    assert extra['quality_passed']
+    assert store.read_json(path.parent/'round_00'/'result.json')['issues']
+
+
+def test_plan_preserves_approved_duration(tmp_path):
+    context=dict(scene=dict(scene_id='scene_1',narration=visual_plan()['narration']),target_seconds=3)
+    plan=visual_plan()
+    pipeline.validate_plan(plan,context)
+    plan['duration']=4
+    with pytest.raises(store.WorkflowError):pipeline.validate_plan(plan,context)
+
+
+def test_formula_fit_rejects_unreadable_shrinking():
+    from manim import Rectangle
+    from src.scene_design.manim_kit import fit_to_safe_area
+    with pytest.raises(ValueError,match='LAYOUT_REPLAN_REQUIRED'):
+        fit_to_safe_area(Rectangle(width=20,height=2),min_scale=.8)
+
+
+def test_new_workflow_human_gates_native_av_and_cached_calls(tmp_path):
+    from tests.test_av import wave_bytes
+    from src.shared import workflow as wf
+    from src.shared.review import record_review
+    from src.preview import av_workflow as av
+    from src.shared.media_tools import probe
+    root=approved_v3_project(tmp_path,narration=visual_plan()['narration'],brief=dict(min_seconds=0,max_seconds=30))
+    router,vision=CodeRouter(),VisionRouter()
+    def context(root,p,reviews):
+        return wf._latest(p,'script',None),store.read_json(root/'input.json'),{'scene_1':3}
+    def synth(root,text,config,retry=None):
+        path=root/'sample.wav'
+        if not path.exists():path.write_bytes(wave_bytes(1))
+        return dict(path='sample.wav',sha256=store.digest(path),duration=1,text=text)
+    with patch.object(sg,'CLIENT_FACTORY',return_value=router), \
+         patch.object(sg,'_context',side_effect=context), \
+         patch('src.scene_design.scene_vision.CLIENT_FACTORY',return_value=vision), \
+         patch('src.scene_design.scene_vision.review_model',return_value=vision.model):
+        state=sg.run_scenes(root,scene_id='scene_1')
+        design=state['pending_reviews'][0]
+        assert design['design_pipeline']==3
+        calls=len(router.requests)+len(vision.requests)
+        record_review(root,'scene_design',design['version'],'approve',scene_id='scene_1')
+        clip=sg.run_scenes(root,scene_id='scene_1')['pending_reviews'][0]
+        assert clip['sha256']==design['manim_render']['sha256']
+        assert len(router.requests)+len(vision.requests)==calls
+        record_review(root,'scene_clip',clip['version'],'approve',scene_id='scene_1')
+        from src.scene_design import scene_revision as rev
+        cycle=rev.request_revision(root,'scene_1',clip['version'],clip['sha256'],'Sửa cách đặt nhãn.')
+        cycle=rev.resume_revision(root,cycle['id'])
+        assert cycle['status']=='awaiting_design'
+        candidate=cycle['designs']['scene_1']
+        assert candidate['design_pipeline']==3
+        rev.approve_design(root,cycle['id'],'scene_1',candidate['sha256'])
+        cycle=rev.resume_revision(root,cycle['id'])
+        new_clip=cycle['clips']['scene_1']
+        record_review(root,'scene_clip',new_clip['version'],'approve',scene_id='scene_1')
+        calls=len(router.requests)+len(vision.requests)
+        av.configure(root,dict(vnd_per_million_chars=333334,vnd_per_usd=25000))
+        with patch.object(av,'CLIENT_FACTORY',return_value=router),patch.object(av,'SYNTHESIZER',side_effect=synth):
+            state=av.generate(root)
+            candidate=state['pending_reviews'][0]
+            assert candidate['stage']=='scene_av'
+            assert av.delivery_resolution(state)==[1080,1920]
+            stream=next(s for s in probe(candidate['path'])['streams'] if s['codec_type']=='video')
+            assert (stream['width'],stream['height'],stream['avg_frame_rate'])==(1080,1920,'30/1')
+            assert len(router.requests)+len(vision.requests)==calls
+            av.generate(root)
+            assert len(router.requests)+len(vision.requests)==calls
+            record_review(root,'scene_av',candidate['version'],'approve',scene_id='scene_1')
+            final=av.generate(root)['pending_reviews'][0]
+            assert final['stage']=='final_video'
+            stream=next(s for s in probe(final['path'])['streams'] if s['codec_type']=='video')
+            assert (stream['width'],stream['height'],stream['avg_frame_rate'])==(1080,1920,'30/1')
+            assert not (root/'final.mp4').exists()
+
+
+def test_runtime_failure_repairs_code_without_new_plan(tmp_path):
+    bad=SOURCE.replace('        self.add(title, point)',"        raise ValueError('fixture runtime failure')")
+    (path,extra),session,context,vision=run_pipeline(tmp_path,CodeRouter([bad,SOURCE]))
+    phases=[c['phase'] for c in session.job['calls']]
+    assert extra['quality_passed']
+    code_requests=[r for r in session.client.requests if 'source' in r['schema']['properties']]
+    feedback=json.loads(code_requests[-1]['messages'][1]['content'])
+    assert 'fixture runtime failure' in feedback['repair_history'][0]['issues'][0]['problem']
+    assert 'v3_plan_1' not in phases and 'v3_code_1' in phases
+    assert 'fixture runtime failure' in store.read_json(path.parent/'round_00'/'result.json')['issues'][0]['problem']
+
+
+def test_missing_installed_api_replans_before_coding(tmp_path):
+    class MissingAPIRouter(CodeRouter):
+        def complete(self,payload):
+            response=super().complete(payload)
+            result=json.loads(response['choices'][0]['message']['content'])
+            if 'beats' in result and sum('beats' in p['schema']['properties'] for p in self.requests)==1:
+                result['required_apis']=['UnavailableFixtureManimAPI']
+                response['choices'][0]['message']['content']=json.dumps(result,ensure_ascii=False)
+            return response
+    (path,extra),session,context,vision=run_pipeline(tmp_path,MissingAPIRouter())
+    phases=[c['phase'] for c in session.job['calls']]
+    assert extra['quality_passed']
+    assert 'v3_plan_1' in phases and 'v3_code_0' not in phases and 'v3_code_1' in phases
+
+
+def test_final_layout_change_is_rejected():
+    before=dict(checked_frames=30,object_ids=['label'],issues=[],samples=[dict(frame=0,
+        objects=dict(label=dict(box=[0,1,0,1])))])
+    after=copy.deepcopy(before)
+    after['samples'][0]['objects']['label']['box']=[1,2,0,1]
+    result=pipeline.compare_layouts(before,after,dict(objects=[dict(id='label')]))
+    assert not result['passed']
+    assert 'differs' in result['issues'][0]['problem']
+
+
+def test_validated_preview_accepts_average_frame_rate_rounding(tmp_path):
+    render=sg.RENDERER
+    def encoded_average(*args,**kwargs):
+        result=render(*args,**kwargs)
+        assert result['status']=='success',result
+        metadata_path=Path(result['log_path']).with_suffix('.json')
+        metadata=store.read_json(metadata_path)
+        # A worker-validated video may report this average due to timestamps.
+        metadata['video']['fps']=30.00412688805128
+        store.atomic_write(metadata_path,metadata)
+        return result
+    with patch.object(sg,'RENDERER',side_effect=encoded_average):
+        (path,extra),session,context,vision=run_pipeline(tmp_path,repairs=0)
+    assert extra['quality_passed']
+    assert extra['manim_render']['video']['fps']==30.00412688805128
+    assert len(vision.requests)==1
+
+
+def test_helper_references_resolve_installed_sdk_and_validate_keywords():
+    from src.scene_design import scene_references
+    from src.scene_design.manim_kit import vn_text,MIN_FONT_SIZE
+    refs=scene_references.lookup(['vn_text','track','manim_kit.vn_text','Text'],['group_motion'])
+    assert not refs['missing']
+    assert refs['installed_apis']['vn_text']['module'].endswith('manim_kit')
+    assert 'size' in refs['component_apis']['vn_text']['keywords']
+    assert 'font_size' in refs['component_apis']['vn_text']['keywords']
+    assert vn_text('Mặc định').font_size>=MIN_FONT_SIZE
+    assert vn_text('Alias',font_size=32).font_size==pytest.approx(vn_text('Alias',size=32).font_size)
+    with pytest.raises(ValueError,match='disagree'):vn_text('Conflict',size=22,font_size=32)
+    source=SOURCE.replace("vn_text('Chuyển động', 28)","vn_text('Chuyển động', font_szie=28)")
+    with pytest.raises(store.WorkflowError,match='Installed helper signature'):
+        pipeline.validate_helper_calls(source,refs)
+    assert pipeline.validate_helper_calls(SOURCE,refs)==SOURCE
+
+
+# API spellings from the real failed chocolate-scene plan (10 APIs, not >16).
+PRODUCTION_APIS = ['manim.VGroup','manim.Polygon','manim.Rectangle','manim.Line',
+    'manim.Create','manim.Transform','manim.Indicate','src.scene_design.manim_kit.vn_text',
+    'src.scene_design.manim_kit.track','src.scene_design.manim_kit.finish_scene']
+
+
+class QualifiedPlanRouter(CodeRouter):
+    def complete(self,payload):
+        response=super().complete(payload)
+        value=json.loads(response['choices'][0]['message']['content'])
+        if 'beats' in value:
+            value['required_apis']=PRODUCTION_APIS
+            response['choices'][0]['message']['content']=json.dumps(value,ensure_ascii=False)
+        return response
+
+
+def test_real_render_with_production_fully_qualified_plan(tmp_path):
+    (path,extra),session,context,vision=run_pipeline(tmp_path,QualifiedPlanRouter(),repairs=0)
+    assert extra['quality_passed']
+    assert [c['phase'] for c in session.job['calls']][:2]==['v3_plan_0','v3_code_0']
+    assert len(vision.requests)==1
+
+
+def test_invalid_reference_replans_instead_of_repeating_lookup(tmp_path):
+    class InvalidFirstPlan(QualifiedPlanRouter):
+        def complete(self,payload):
+            response=super().complete(payload)
+            value=json.loads(response['choices'][0]['message']['content'])
+            if 'beats' in value and sum('beats' in r['schema']['properties'] for r in self.requests)==1:
+                value['required_apis']=['os.system']
+                response['choices'][0]['message']['content']=json.dumps(value)
+            return response
+    (path,extra),session,context,vision=run_pipeline(tmp_path,InvalidFirstPlan(),repairs=1)
+    assert extra['quality_passed']
+    phases=[c['phase'] for c in session.job['calls']]
+    assert 'v3_plan_1' in phases and 'v3_code_0' not in phases and 'v3_code_1' in phases
+    issue=store.read_json(path.parent/'round_00/result.json')['issues'][0]
+    assert issue['category']=='unsupported' and 'required_apis' in issue['fix']
+
+
+def test_brief_animations_have_actual_motion_evidence_and_selected_frames(tmp_path):
+    source=SOURCE.replace("        self.play(point.animate.shift(2*RIGHT), run_time=2, rate_func=linear)",
+        "        cut=track(self,'cut',Line([-2,-2,0],[2,-2,0],color=YELLOW),kind='shape',layout_role='focal')\n"
+        "        self.play(Create(cut),run_time=.5)\n"
+        "        self.play(point.animate.shift(RIGHT),run_time=.5)\n"
+        "        self.play(Transform(title,vn_text('1',28).move_to(title)),run_time=.2)\n"
+        "        self.play(title.animate.shift(.1*RIGHT),run_time=.1)\n"
+        "        self.play(title.animate.shift(.1*LEFT),run_time=.1)")
+    source=source.replace("kind='text',layout_role='hud'","kind='text',layout_role='focal'")
+    plan=visual_plan()
+    plan['objects'][0].update(layout_role='focal',anchor=[],observation_intervals=[dict(start=0,end=3)])
+    plan['hud_region']=[]
+    plan['objects'].append(dict(id='cut',kind='shape',layout_role='focal',anchor=[],
+        observation_intervals=[dict(start=.5,end=3)]))
+    (path,extra),session,context,vision=run_pipeline(tmp_path,CodeRouter([source],plan=plan),repairs=0)
+    telemetry=store.read_json(path.parent/'round_00/layout_telemetry.json')
+    checks=store.read_json(path.parent/'round_00/motion_checks.json')
+    frames={f['frame'] for f in store.read_json(path.parent/'round_00/evidence.json')['frames']}
+    assert checks['motion_events']==telemetry['events']
+    create=next(e for e in telemetry['events'] if any(a['type']=='Create' for a in e['animations']))
+    change=next(e for e in telemetry['events'] if any(a.get('target_text')=='1' for a in e['animations']))
+    assert create['middle_frame'] in frames and change['middle_frame'] in frames
+    point_motion=next(e['motion']['point'] for e in telemetry['events'] if e.get('motion',{}).get('point',{}).get('changed_frames',0)>0)
+    assert point_motion['last_box'][0]>point_motion['first_box'][0]
+    wait=next(e for e in telemetry['events'] if e.get('is_wait') and e['end_frame']-e['start_frame']>10)
+    assert wait['middle_frame'] not in frames
+
+
+def test_transform_to_genuinely_small_text_still_fails_layout(tmp_path):
+    source=SOURCE.replace("self.play(point.animate.shift(2*RIGHT), run_time=2, rate_func=linear)",
+        "self.play(Transform(title,vn_text('1',12).move_to(title)),run_time=.5)")
+    with pytest.raises(store.WorkflowError,match='below contract minimum'):
+        run_pipeline(tmp_path,CodeRouter([source]),repairs=0)
+    issues=store.read_json(tmp_path/'generation/direct/round_00/motion_checks.json')['issues']
+    assert any(i['object_ids']==['title'] and i['time']>0 for i in issues)
+
+
+def test_missing_native_evidence_stops_without_review_or_code_repair(tmp_path,monkeypatch):
+    original=pipeline._manifest
+    def require_native(plan,bundle):
+        design=original(plan,bundle)
+        rule=plan['criterion_rules'][0]
+        design['evidence_requirements']=[dict(beat_id=rule['beat_id'],criterion=rule['criterion'],source='native')]
+        return design
+    monkeypatch.setattr(pipeline,'_manifest',require_native)
+    def no_review(*args,**kwargs):
+        raise AssertionError('Missing source must stop before calling any reviewer')
+    monkeypatch.setattr(pipeline.legacy,'_review',no_review)
+    router=CodeRouter()
+    with pytest.raises(store.WorkflowError) as exc:
+        run_pipeline(tmp_path,router,repairs=2)
+    assert exc.value.code=='SCENE_EVIDENCE_REQUIRED'
+    assert router.code_count==1
+    work=tmp_path/'generation/direct/round_00'
+    assert (work/'scene.py').is_file()
+    assert not (tmp_path/'generation/direct/round_01').exists()
+
+
+def approved_v3_project(root,narration,brief):
+    from tests.ai_support import valid_script
+    from src.shared import workflow as wf, _workflow_store as store
+    from src.shared.review import record_review
+    wf.create_project(root,'V3 local workflow regression')
+    script=valid_script()
+    script['scenes']=[dict(scene_id='scene_1',narration=narration,visual_intent='Diagram',claim_refs=['claim_01'])]
+    payloads={'script.json':dict(script=script,brief=brief),'research.json':dict(sources=[],claims=script['claims']),'generation.json':dict(calls=[])}
+    directory=root/'generation/fixture';directory.mkdir(parents=True)
+    for name,value in payloads.items():store.atomic_write(directory/name,value)
+    store.atomic_write(root/'input.json',payloads['script.json'])
+    source=root/'input.md';source.write_text('Local fixture script')
+    wf.submit_artifact(root,'script','v001',source,scene_ids=['scene_1'])
+    p,r=wf._load(root);wf._latest(p,'script',None).update(origin='ai',bundle={name:dict(path=str((directory/name).relative_to(root)),sha256=store.digest(directory/name)) for name in payloads});wf._save(root,p,r)
+    record_review(root,'script','v001','approve',read_seconds=30)
+    store.atomic_write(root/'scene_config.json',copy.deepcopy(sg.DEFAULT_CONFIG))
+    return root
