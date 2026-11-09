@@ -64,14 +64,4 @@ class VisionRouter(FakeCodex):
         self.requests.append(copy.deepcopy(payload));context=json.loads(payload['messages'][1]['content'][0]['text']);storyboard=context['storyboard'];issues=self.reviews[min(len(self.requests)-1,len(self.reviews)-1)] if self.reviews else []
         results=[dict(beat_id=b['id'],criterion=criterion,passed=not issues,evidence='Khung hình cho thấy điểm và đường cập nhật đúng ở đầu, giữa và cuối cảnh.') for b in storyboard['beats'] for criterion in b['criteria']]
         result=dict(passed=not issues,summary='Các tiêu chí storyboard được kiểm tra qua khung hình.' if not issues else 'Cần sửa cảnh.',issues=issues,criteria_results=results)
-        if context.get('system_contract'):
-            result['passed'] = result['passed'] and context['render_checks'].get('passed',False) and context['render_checks'].get('layout_checks',{}).get('passed',False)
-            from src.scene_design import system_contract as system
-            rules={(r['beat_id'],r['criterion']):r for r in context['design']['layout_plan']['criterion_rules']}
-            for row in results:
-                rule=rules[(row['beat_id'],row['criterion'])]
-                skipped=rule['check']=='cross_scene_continuity' and context['continuity_evidence']['status']!='verified'
-                row['status']='not_applicable' if skipped else 'fail' if issues else 'pass'
-                row.pop('passed')
-            result.update(system.reference(context['system_contract']))
         return dict(id='vision-'+str(len(self.requests)),model=self.model,usage=dict(billing_source='codex_subscription',prompt_tokens=100,completion_tokens=100,cost=None),choices=[dict(finish_reason='stop',message=dict(content=json.dumps(result,ensure_ascii=False)))])

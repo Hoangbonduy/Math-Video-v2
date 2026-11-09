@@ -24,7 +24,7 @@ BUDGET=0.50
 BASE='generation/checkpoint_5'
 DESIGN_REPAIR_LIMIT=2
 DESIGN_PIPELINE_VERSION=3
-DESIGN_PROMPT_VERSION=15
+DESIGN_PROMPT_VERSION=16
 
 
 def _index(root):
@@ -289,13 +289,7 @@ def _clip(root,directory,session,context):
 
 
 def repair_limit(trial_mode=False):
-    # Temporary single-pass default: initial attempt + zero automatic repairs.
-    name='SCENE_TRIAL_REPAIRS' if trial_mode and 'SCENE_TRIAL_REPAIRS' in os.environ else 'SCENE_MAX_REPAIRS'
-    try:
-        value=int(os.environ.get(name,'0').strip())
-    except ValueError:
-        raise WorkflowError('INVALID_INPUT',name+' must be an integer from 0 to 3') from None
-    return max(0,min(3,value))
+    return 2
 
 
 def resume_input(jobs, fingerprint, attempt_id):
@@ -357,8 +351,6 @@ def run_scenes(project_dir, *, scene_id=None, retry_uncertain=None, trial_mode=F
     from src.scene_design.manim_runtime import info as runtime_info
     if attempt_id is not None and (not isinstance(attempt_id,str) or not attempt_id or len(attempt_id)>128 or retry_uncertain):
         raise WorkflowError("INVALID_INPUT", "Mã lượt chạy mới không hợp lệ")
-    from src.scene_design import system_contract as system
-    bundle=system.load() if DESIGN_PIPELINE_VERSION==3 else None
     repairs=repair_limit(trial_mode)
     if not prepare_only:
         runtime_info()  # Fail before any paid call if the environment is unavailable.
@@ -443,15 +435,9 @@ def run_scenes(project_dir, *, scene_id=None, retry_uncertain=None, trial_mode=F
                     script_bundle=script['bundle'],base_version=base['version'] if base else None,base_sha256=base['sha256'] if base else None,feedback=feedback,
                     config=config,design_sha256=design['sha256'] if design else None,model=get_model(),**(dict(design_pipeline=DESIGN_PIPELINE_VERSION,design_prompt_version=DESIGN_PROMPT_VERSION if DESIGN_PIPELINE_VERSION==3 else 8,max_repairs=repairs) if stage=='scene_design' and DESIGN_PIPELINE_VERSION in (2,3) else {}))
                 previous_render=None
-                if bundle and stage=='scene_design':
-                    from src.scene_design.contract_review import previous_render_reference
-                    previous_render=previous_render_reference(root,project,reviews,payload['script'],target)
-                    fingerprint.update(system.reference(bundle))
-                    fingerprint['execution_policy']=dict(prompt_version=DESIGN_PROMPT_VERSION,max_repairs=repairs,planning_gates=3,planning_policy_version=1,material_audit_version=2,visual_review_after_findings=True)
-                    from src.scene_design import scene_plan_handoff
-                    available=scene_plan_handoff.references(root,_jobs(root),payload['script'],script['sha256'],bundle,config)
-                    fingerprint['planning_references']=scene_plan_handoff.for_scene(available,payload['script'],target)
-                    fingerprint['previous_render']=previous_render
+                if stage=='scene_design':
+                    fingerprint['execution_policy']=dict(prompt_version=DESIGN_PROMPT_VERSION,max_repairs=2,
+                        human_approval_required=True,visual_review_before_human=True)
                 if 'global_visuals' in payload['script']:
                     from src.scene_design.script_visuals import VERSION
                     fingerprint['visual_handoff_version']=VERSION
@@ -498,8 +484,6 @@ def run_scenes(project_dir, *, scene_id=None, retry_uncertain=None, trial_mode=F
                         raise WorkflowError('CODEX_RESULT_UNKNOWN','Resolve the saved request before changing evidence')
                     job['evidence_options']=dict(frame_budget=evidence_frame_budget)
                     store.atomic_write(directory/'job.json',job)
-                if bundle and stage=='scene_design':
-                    system.bind_job(directory,job,bundle)
                 is_opening_scene = (target == project['scene_ids'][0])
                 context = dict(
                     script=payload['script'],
@@ -512,9 +496,6 @@ def run_scenes(project_dir, *, scene_id=None, retry_uncertain=None, trial_mode=F
                 )
                 if job.get('evidence_options') and stage=='scene_design':
                     context['evidence_frame_budget']=job['evidence_options']['frame_budget']
-                if bundle and stage=='scene_design':
-                    context.update(system_contract=bundle,previous_scene_render=previous_render,
-                        planning_references=scene_plan_handoff.load(root,job['input'].get('planning_references',[]),bundle))
                 if stage=='scene_design':
                     from src.scene_design.scene_drafts import current as current_drafts
                     drafts=current_drafts(root)
@@ -566,7 +547,7 @@ def run_scenes(project_dir, *, scene_id=None, retry_uncertain=None, trial_mode=F
                     context['assets']=store.read_json(design_dir/'assets.json')
                     if base: context['previous_code']=(root/base['code_path']).read_text()
             if prepare_only:
-                # Persist exact current inputs and contract, without a client or render.
+                # Persist exact current inputs, without a client or render.
                 continue
             try:
                 selected_retry=retry_uncertain if any(c['call_id']==retry_uncertain for c in job['calls']) else None
@@ -610,11 +591,6 @@ def run_scenes(project_dir, *, scene_id=None, retry_uncertain=None, trial_mode=F
                             and wf._request(reviews,current)['status']=='pending')
                     if project['stage']!=stage or current_script['sha256']!=script['sha256'] or current_script['version']!=fingerprint['script_version'] or not same_base or _config(root)!=config:
                         raise WorkflowError('STALE_JOB','Scene inputs changed; result retained but not registered')
-                    if bundle and stage=='scene_design':
-                        if system.load()['sha256']!=bundle['sha256']:
-                            raise WorkflowError('STALE_JOB','System contract changed; result retained but not registered')
-                        if previous_render_reference(root,project,reviews,payload['script'],target)!=fingerprint['previous_render']:
-                            raise WorkflowError('STALE_JOB','Previous scene render changed during review')
                     if design: wf._verify(root,wf._latest(project,'scene_design',target))
                     wf._submit(root,project,reviews,stage,extra.get('clip_version',version),source,target,None)
                     artifact=wf._latest(project,stage,target)

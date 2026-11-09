@@ -79,14 +79,6 @@ def render(request):
     # The worker is launched with an artifact directory as cwd. Make the SDK
     # available under both imports admitted by the scene AST policy.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    bundle=request.get('system_contract')
-    if bundle:
-        from src.scene_design import system_contract as system, scene_theme
-        system.verify(bundle)
-        system.assert_reference(request['layout_plan'],bundle)
-        system.validate_ast(Path(request['scene_file']).read_text(),bundle)
-        system.validate_tracking(Path(request['scene_file']).read_text(),request['layout_plan'])
-        scene_theme.configure(bundle)
     from src.scene_design import manim_kit
     sys.modules["manim_kit"] = manim_kit
     source = Path(request["scene_file"])
@@ -109,9 +101,6 @@ def render(request):
         # still determine output resolution, FPS and output location.
         with tempconfig(request["settings"]):
             scene=scene_class()
-            if bundle:
-                scene.system_contract=bundle
-                scene.layout_plan=request['layout_plan']
             scene.camera.display_image_mobject=compatible_camera().display_image_mobject.__get__(scene.camera)
             telemetry = None
             if request.get('collect_layout'):

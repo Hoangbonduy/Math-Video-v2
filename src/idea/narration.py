@@ -69,7 +69,7 @@ def critic_messages(topic, brief, draft, *, guidelines_text=None):
             draft=draft), ensure_ascii=False))]
 
 
-def editing_messages(topic, brief, sources, draft, *, previous=None, feedback=None, guidelines_text=None, system_contract=None):
+def editing_messages(topic, brief, sources, draft, *, previous=None, feedback=None, guidelines_text=None):
     messages = writing_messages(topic, brief, sources, previous=previous, feedback=feedback,
                                 guidelines_text=guidelines_text)
     messages[0]['content'] += (
@@ -84,10 +84,6 @@ def editing_messages(topic, brief, sources, draft, *, previous=None, feedback=No
         'không hiển thị đáp án. Chỉ khi có dòng 6, hình vẫn chuyển động khi đọc toàn bộ câu chốt. Trả kịch bản theo schema được cung cấp, có global_visuals, không trả narration_draft.')
     context = json.loads(messages[1]['content'])
     messages[0]['content'] += '\n' + VISUAL_INSTRUCTIONS
-    from src.scene_design import system_contract as system
-    bundle=system.verify(system_contract) if system_contract else system.load()
-    messages[0]['content'] += system.instructions(bundle)
-    context['system_contract']=bundle
     context['narration_draft'] = draft
     messages[1]['content'] = json.dumps(context, ensure_ascii=False)
     return messages

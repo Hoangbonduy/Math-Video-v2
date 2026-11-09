@@ -10,7 +10,7 @@ def publish(root, work, session, reference, *, evidence_work=None):
     checks=store.read_json(evidence_work/'render_checks.json')
     motion=store.read_json(evidence_work/'motion_checks.json')
     design=store.read_json(work/'design.json')
-    deferred=bool(design.get('layout_plan',{}).get('planning_policy_version'))
+    deferred=design.get('schema_version')==3
     if not checks['passed'] or (not motion['passed'] and not deferred):
         raise WorkflowError('DRAFT_INVALID','Bản nháp cần qua kiểm tra chuyển động và render.')
     for key,digest in [('path','sha256'),('code_path','code_sha256')]:
@@ -257,8 +257,6 @@ def failed_renders(root):
                 if checks.get('passed') is not False:
                     continue
                 ref=record['reference']
-                if any(ref.get(k)!=inputs.get(k) for k in ('contract_version','contract_sha256')):
-                    continue
                 paths=[work/n for n in ('code_render.json','motion_checks.json','render_checks.json',
                                        'design.json','storyboard.json','evidence.json')]
                 if (work/'visual_review.json').exists():

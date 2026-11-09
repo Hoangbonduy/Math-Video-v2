@@ -1,31 +1,19 @@
-"""Resolution-independent portrait profile sourced from the system contract."""
-from src.scene_design import system_contract as system
+"""Resolution-independent render settings; no external execution policy."""
+import copy
+
+FRAME_WIDTH, FRAME_HEIGHT = 9.0, 16.0
+SAFE_X, SAFE_TOP, SAFE_BOTTOM = .55, .55, 1.5
+SAFE_WIDTH, SAFE_HEIGHT, MIN_FONT_SIZE = 7.9, 13.95, 22
+PREVIEW_RESOLUTION, FINAL_RESOLUTION, FPS = (360,640), (1080,1920), 30
 
 
-def configure(bundle):
-    global FRAME_WIDTH, FRAME_HEIGHT, SAFE_X, SAFE_TOP, SAFE_BOTTOM
-    global SAFE_WIDTH, SAFE_HEIGHT, MIN_FONT_SIZE, PREVIEW_RESOLUTION, FINAL_RESOLUTION, FPS
-    p = system.profile(system.verify(bundle))
-    FRAME_WIDTH, FRAME_HEIGHT = p['frame_width'], p['frame_height']
-    SAFE_WIDTH, SAFE_HEIGHT, MIN_FONT_SIZE = p['safe_width'], p['safe_height'], p['min_font_size']
-    SAFE_X = p['safe_bounds'][0] + FRAME_WIDTH/2
-    SAFE_BOTTOM = p['safe_bounds'][2] + FRAME_HEIGHT/2
-    SAFE_TOP = FRAME_HEIGHT/2 - p['safe_bounds'][3]
-    PREVIEW_RESOLUTION, FINAL_RESOLUTION = tuple(p['preview_resolution']), tuple(p['final_resolution'])
-    FPS = p['fps']
+def profile():
+    return dict(frame_width=FRAME_WIDTH,frame_height=FRAME_HEIGHT,
+        safe_width=SAFE_WIDTH,safe_height=SAFE_HEIGHT,safe_bounds=[-3.95,3.95,-6.5,7.45],
+        min_font_size=MIN_FONT_SIZE,preview_resolution=list(PREVIEW_RESOLUTION),
+        final_resolution=list(FINAL_RESOLUTION),fps=FPS,duration_tolerance_frames=2)
 
 
-configure(system.load())
-
-
-def profile(bundle=None):
-    p = system.profile(bundle or system.load())
-    p['rule'] = ('Same scene coordinates, fonts, strokes, timing and fixed camera in both renders; '
-                 'only pixel density changes. Final is rendered from approved source, never upscaled.')
-    return p
-
-
-def render_profile(config, final=False, bundle=None):
-    p = profile(bundle)
-    return dict(config, resolution=list(p['final_resolution'] if final else p['preview_resolution']),
-                fps=p['fps'], frame_height=p['frame_height'])
+def render_profile(config, final=False):
+    return dict(config,resolution=list(FINAL_RESOLUTION if final else PREVIEW_RESOLUTION),
+                fps=FPS,frame_height=FRAME_HEIGHT)

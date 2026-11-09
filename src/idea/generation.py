@@ -71,7 +71,6 @@ def _validated_call(session, phase, messages, schema, validate, repairs, *, repa
 def _produce(session, topic, brief, previous=None, feedback=None):
     job, directory = session.job, session.directory
     prompt_version = job['input'].get('prompt_version')
-    from src.scene_design import system_contract as system
     guidelines_text, current_digest = load_guidelines()
     if prompt_version != PROMPT_VERSION or job['input'].get('guidelines_sha256') != current_digest:
         raise WorkflowError('GUIDELINE_CHANGED', 'Job không dùng guideline hiện tại; hãy tạo lượt mới từ Ý tưởng kịch bản')
@@ -79,9 +78,6 @@ def _produce(session, topic, brief, previous=None, feedback=None):
     if snapshot.exists() and guideline_digest(snapshot.read_text(encoding='utf-8')) != current_digest:
         raise WorkflowError('GUIDELINE_CHANGED', 'Snapshot guideline của job không khớp bản hiện tại; hãy tạo lượt mới')
     store.materialize(directory, 'guidelines_snapshot.md', content=guidelines_text.encode('utf-8'))
-    bundle=system.load()
-    system.assert_reference(job['input'],bundle)
-    system.bind_job(directory,job,bundle)
     research_path = directory / "research_inputs.json"
     previous_sources = previous["research"]["sources"] if previous else []
     needs_research = previous is None
@@ -140,7 +136,7 @@ def _produce(session, topic, brief, previous=None, feedback=None):
     store.materialize(directory, 'critique.json', content=_json_bytes(critique))
     store.materialize(directory, 'approved_narration.json', content=_json_bytes(draft))
     messages = editing_messages(topic, brief, research['sources'], draft,
-                                previous=previous_script, feedback=feedback, guidelines_text=guidelines_text, system_contract=bundle)
+                                previous=previous_script, feedback=feedback, guidelines_text=guidelines_text)
 
     def validate(value):
         script = align_evidence_spacing(value, research['sources'], schema=VISUAL_SCRIPT_SCHEMA)
@@ -218,14 +214,9 @@ def run_ai(project_dir, *, retry_uncertain=None):
                     fingerprint['prompt_version'] = saved_job['input']['prompt_version']
                 if 'guidelines_sha256' in saved_job['input']:
                     fingerprint['guidelines_sha256'] = saved_job['input']['guidelines_sha256']
-                for key in ('contract_version','contract_sha256'):
-                    if key in saved_job['input']:
-                        fingerprint[key]=saved_job['input'][key]
             else:
                 fingerprint['prompt_version'] = PROMPT_VERSION
                 _, fingerprint['guidelines_sha256'] = load_guidelines()
-                from src.scene_design import system_contract as system
-                fingerprint.update(system.reference(system.load()))
             if subscription_billing():fingerprint['ai_backend']=get_backend()
             job_id = "script_" + version + "_" + hashlib.sha256(_json_bytes(fingerprint)).hexdigest()[:16]
             relative = f"generation/{job_id}/job.json"

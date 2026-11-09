@@ -38,7 +38,7 @@ function designFor(id, version) { return context.designs?.[id + ':' + version] |
 function sceneData(id) { return context.script?.scenes?.find(s => s.scene_id === id) || {}; }
 function shortTitle(id) {
   const design = designFor(id, latest(id, 'scene_design')?.version);
-  const title = design.objects?.find(o => o.kind === 'text' && o.label.trim());
+  const title = design.objects?.find(o => o.kind === 'text' && typeof o.label === 'string' && o.label.trim());
   return title?.label || sceneData(id).title || 'Cảnh ' + String(state.scene_ids.indexOf(id) + 1).padStart(2, '0');
 }
 function clock(seconds) { const s = Math.max(0, Math.round(Number(seconds) || 0)); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }

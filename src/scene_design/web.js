@@ -26,7 +26,8 @@ function sceneBatchFailure() {
 function sceneRepairLabel(job) {
   const limit=job?.max_repairs ?? 0;
   if(limit===0)return 'Ch\u1ea1y th\u1eed 1 l\u01b0\u1ee3t \u00b7 Kh\u00f4ng t\u1ef1 s\u1eeda';
-  return (job?.trial_mode?'Ch\u1ea1y th\u1eed \u00b7 ':'')+'V\u00f2ng s\u1eeda '+(job?.repair_round ?? 0)+' / '+limit;
+  const round=job?.repair_round ?? 0;
+  return round===0 ? 'Bản dựng đầu · Tự sửa tối đa '+limit+' lần' : 'Lượt sửa '+round+' / '+limit;
 }
 function scenePhase(job) { return scenePhases[job?.progress] || 'Đang chuẩn bị cảnh Manim'; }
 function renderSceneProgress(artifact) {
@@ -62,7 +63,7 @@ function renderSceneProgress(artifact) {
   el('strong',running ? task.state==='pausing'?'Đang tạm dừng…':task.state==='queued'?'Đang xếp hàng':scenePhase(job) : approved?'Đã duyệt':paused?'Đã tạm dừng · Chờ ghi chú duyệt':failed?(batchFailure?'Tác vụ dừng trước khi tạo cảnh':job?.render_status==='success'?'Đã render · Chưa đạt kiểm tra':rendered?(!matchingDraft && job?.status==='failed'?'Lượt mới bị lỗi · Đang giữ bản nháp trước':'Đã dựng bản nháp · Cần chỉnh sửa'):'Đã dừng · Chưa có bản nháp đạt kiểm tra'):ready?'Video Manim đã sẵn sàng':'Chưa chạy tạo cảnh Manim',body);
   const engine = job?.kind==='saved_design_render' ? 'Thiết kế Codex đã lưu · Dựng tại máy' : (job?.kind === 'manim_design_preview' || job?.preview_engine === 'json') ? 'Preview từ thiết kế · Chạy tại máy' : 'AI: '+(job?.model || state.scene_generation?.model || 'Đang đọc cấu hình');
   el('p','Cảnh '+String(state.scene_ids.indexOf(sid)+1).padStart(2,'0')+' · '+engine+' · Render: Manim / Cairo',body);
-  if(job?.design_pipeline===3)el('p','Kịch bản + phong cách + khả năng hệ thống → kế hoạch → mã Manim → render 360 × 640 / 30 FPS → đánh giá hình · '+sceneRepairLabel(job),body);
+  if(job?.design_pipeline===3)el('p','Kịch bản → kế hoạch → đọc tài liệu Manim → viết mã → render nháp → AI kiểm tra → bạn duyệt · '+sceneRepairLabel(job),body);
   if(job?.design_pipeline===2)el('p','Storyboard → thiết kế → render → đánh giá hình · '+sceneRepairLabel(job),body);
   renderSceneActivity(body,job);
   if(running){
@@ -76,7 +77,7 @@ function renderSceneProgress(artifact) {
   else if(failed){
     const error=job?.last_error || task?.error || batchFailure?.error || 'Không hoàn tất tạo cảnh.';
     if(job?.quality_issues?.length){
-      el('p',draftReview?.summary || (job?.render_status==='success'?'Video đã render; các kiểm tra dưới đây chưa đạt.':'Lượt tạo cảnh hiện tại gặp các lỗi dưới đây.'),body,'scene-error');
+      el('p',draftReview?.summary || (job?.render_status==='success'?'AI đã dừng vòng sửa; bản nháp và lỗi còn lại được giữ để bạn quyết định.':'Lượt tạo cảnh hiện tại gặp các lỗi dưới đây.'),body,'scene-error');
       const issues=el('ol',undefined,body,'scene-quality-issues');
       for(const issue of job.quality_issues){
         const row=el('li',undefined,issues);
@@ -338,7 +339,7 @@ function renderDesignQuality(artifact,parent) {
   if (!artifact || ![2,3].includes(artifact.design_pipeline)) return;
   const panel=el('details',undefined,parent,'design-quality');
   el('summary',artifact.design_pipeline===3?'Kế hoạch hình ảnh và kết quả kiểm tra cảnh':'Storyboard và kết quả kiểm tra cảnh',panel);
-  el('p',artifact.quality_passed === false ? 'Bản nháp đã render nhưng chưa đạt kiểm tra hình ảnh. Bạn có thể gửi góp ý hoặc tự kiểm tra và duyệt thiết kế.' : 'Cảnh đã qua kiểm tra quan hệ trong chuyển động và AI đánh giá các khung hình. Bạn vẫn là người quyết định duyệt.',panel,'muted');
+  el('p',artifact.quality_passed === false ? 'AI đã dừng vòng sửa. Xem bản nháp và lỗi còn lại, rồi quyết định duyệt hoặc gửi góp ý.' : 'Cảnh đã được AI kiểm tra qua các khung hình. Bạn là người duyệt cuối cùng.',panel,'muted');
   const content=el('div',undefined,panel);
   panel.addEventListener('toggle',async()=>{
     if(!panel.open || panel.dataset.loaded)return;
@@ -403,8 +404,8 @@ function paintSceneActivity() {
   for(const [action,tool] of [
     ['Đọc kịch bản và phong cách để lập kế hoạch hình ảnh, chuyển động.','Agent lập kế hoạch'],
     ['Tra cách sử dụng các API cần cho cảnh.','Tra API / reference'],
-    ['Dựng cảnh theo kế hoạch và kiểm tra mã hợp lệ.','Agent dựng cảnh · Kiểm tra mã'],
-    ['Render video và đo bố cục, cỡ chữ, vùng an toàn.','Render Manim / Cairo · Kiểm tra bố cục'],
+    ['Viết mã Manim từ kế hoạch và tài liệu đã đọc.','AI viết mã Manim'],
+    ['Render bản nháp; nếu lỗi thì gửi log về bước sửa mã.','Render Manim / Cairo'],
     ['Lấy ảnh từ video để đánh giá; sửa theo lỗi nếu còn lượt, rồi đưa kết quả để duyệt.','Trích frame bằng FFmpeg · Agent đánh giá hình ảnh']
   ]){const row=el('li',action,roadmap);el('small','Tool: '+tool,row);}
   if(data.plan?.length){

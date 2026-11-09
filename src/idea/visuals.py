@@ -18,13 +18,12 @@ SCENE_HEADINGS = (
 
 VISUAL_INSTRUCTIONS = """
 KHAI BÁO TOÀN CỤC — chỉ một lần ở đầu kịch bản, trong global_visuals:
-Không chép phiên bản hoặc SHA-256 của system_contract vào global_visuals hay visual_intent.
 Đó là metadata snapshot do bộ điều phối quản lý theo job, không phải nội dung kịch bản.
 Vẫn ghi đầy đủ các ràng buộc thực tế về hình học, HUD, dữ kiện và thứ tự tiết lộ.
 Scene Slicer giao ý đồ hình ảnh, không yêu cầu người dùng đã duyệt sẵn mọi đỉnh đa giác,
 đường cắt phụ hay ma trận biến đổi. Planner có trách nhiệm thiết kế các chi tiết thực thi
 còn mở trong phạm vi dữ kiện và ý đồ đã duyệt. Phân biệt lựa chọn thiết kế với đổi dữ kiện.
-Không trả CONTRACT_CONFLICT, “chưa xác định” hoặc “trả về khâu lập kế hoạch” để lấp chỗ
+Không trả thông báo từ chối, “chưa xác định” hoặc “trả về khâu lập kế hoạch” để lấp chỗ
 cho global_visuals, timeline, trạng thái cuối và tiêu chí đạt. Tiêu chí phải là kết quả
 cần đạt, không phải lời từ chối xác minh. Không thay toàn bộ hướng dẫn bằng báo lỗi.
 Nếu phát hiện yêu cầu thực sự mâu thuẫn, nêu các yêu cầu cụ thể xung đột; không giả vờ
@@ -165,8 +164,7 @@ def visual_readiness(script):
             return
         # These are refusal/status fields, never an on-screen caption. Do not
         # flag intentional instructions such as "chua tiet lo dap an".
-        refusal=(re.search(r'^\s*CONTRACT_CONFLICT(?:\s*:|\s*$)',text,re.I)
-                 or re.search(r'chưa (?:thể )?(?:xác định|xác minh|lập|có đủ dữ kiện)',text,re.I)
+        refusal=(re.search(r'chưa (?:thể )?(?:xác định|xác minh|lập|có đủ dữ kiện)',text,re.I)
                  or re.search(r'(?:^|[.!]\s+)Trả về khâu lập kế hoạch',text,re.I))
         if refusal:
             issues.append(dict(field=path,owner='scene_slicer',

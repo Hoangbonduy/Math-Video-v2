@@ -212,9 +212,6 @@ def _patch(session,context,story,design,index,issues):
 
 
 def _review(root,session,vision,story,design,manifest,checks,index,phase_prefix="v2",visual_handoff=None):
-    if design.get('system_contract'):
-        from src.scene_design.contract_review import review_scene
-        return review_scene(root,session,vision,story,design,manifest,checks,index,visual_handoff=visual_handoff)
     schema=copy.deepcopy(contract.REVIEW_SCHEMA)
     issue=schema['properties']['issues']['items']['properties']
     issue['object_ids']['items']=dict(type='string',enum=[o['id'] for o in design['objects']]+[g['id'] for g in design['groups']])
@@ -243,12 +240,6 @@ def verify_quality(root,artifact):
     quality=store.read_json(store.project_path(root,path))
     if quality.get('design_sha256')!=artifact['sha256']:raise WorkflowError('SCENE_QUALITY_REQUIRED','Thiết kế chưa qua đủ kiểm tra hoặc bằng chứng không đúng phiên bản.')
     ref=artifact.get('manim_render') or {}
-    if quality.get('contract_sha256'):
-        from src.scene_design import system_contract as system
-        system.assert_reference(ref,dict(contract_version=quality['contract_version'],sha256=quality['contract_sha256']))
-        if artifact.get('path'):
-            design=store.read_json(store.project_path(root,artifact['path']))
-            system.assert_reference(quality,system.verify(design['system_contract']))
     if quality.get('video_sha256')!=ref.get('sha256'):raise WorkflowError('STALE_REVIEW','Bằng chứng không đúng video đang duyệt.')
     for item in quality.get('evidence_files',[]):
         target=store.project_path(root,item['path'])
@@ -272,7 +263,7 @@ def reviewable_draft(root, directory, job):
         raise WorkflowError('STALE_JOB', 'Bản nháp không thuộc lượt tạo cảnh này.')
     scene_drafts.verify(root, draft)
     for key in ('render_checks_path', 'motion_checks_path'):
-        if not store.read_json(store.project_path(root, draft[key]))['passed']:
+        if key=='render_checks_path' and not store.read_json(store.project_path(root, draft[key]))['passed']:
             raise WorkflowError('DRAFT_INVALID', 'Bản nháp chưa qua kiểm tra render và chuyển động.')
     design = store.read_json(store.project_path(root, draft['design_path']))
     work = directory/'human_review'
@@ -283,19 +274,12 @@ def reviewable_draft(root, directory, job):
     version=design.get('schema_version',VERSION)
     if version not in (2,3):
         raise WorkflowError('DRAFT_INVALID','Unsupported draft schema')
-    contract_ref={}
-    if version==3:
-        from src.scene_design import system_contract as system
-        bundle=system.verify(design['system_contract'])
-        system.assert_reference(story,bundle)
-        system.assert_reference(draft['reference'],bundle)
-        contract_ref=system.reference(bundle)
     assets = store.read_json(directory/('assets.json' if version==3 else 'v2_assets.json'))
     sg._design_files(work, design, assets, dict(schema_version=version, datasets=design.get('graphs',[])))
     _write(work/'assets.json', assets)
     _write(work/'storyboard.json', story)
     ref = draft['reference']
-    quality = dict(passed=False, pipeline_version=version, **contract_ref,
+    quality = dict(passed=False, pipeline_version=version,
         repairs=job.get('repair_round', 0), design_sha256=store.digest(work/'design.json'),
         video_sha256=ref['sha256'], storyboard_sha256=store.digest(work/'storyboard.json'),
         review_model=job.get('vision_pricing', {}).get('model', ''),

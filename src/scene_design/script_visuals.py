@@ -19,13 +19,9 @@ INSTRUCTIONS = (
     'verbatim on-screen text and simultaneous emphasis, then result. '
     'Times are LOCAL seconds starting at zero, never offsets from the entire video. '
     'Resolve narration/event cues within [0,target_seconds]; preserve order and reveal timing. '
-    'Keep narration and target duration immutable; report conflicting requirements rather than dropping them. '
-    'End at scene.end_state. Python copies scene.acceptance_criteria and generates initial/end/continuity '
-    'checks after planning. Code generation and visual review must preserve all approved criteria. '
-    'If contract_binding is present, its active contract_version/contract_sha256 identifies the job snapshot. '
-    'script_authoring_reference is historical provenance of the approved script, not a requirement to run that old snapshot. '
-    'Do not report a contract conflict merely because those two metadata references differ. '
-    'All actual content/geometry/timing/reveal requirements still apply and must be checked against the active snapshot. '
+    'Keep narration and target duration immutable; implement the best construction and verify it in the draft. '
+    'End at scene.end_state. Python copies scene.acceptance_criteria for AI review, including initial/end state '
+    'checks. Code generation and visual review must preserve all approved criteria. '
     'Presentation coordinates may be mapped into renderer coordinates while preserving the declared '
     'mathematical dimensions and relationships. Keep required captions/numbers verbatim.'
 )
@@ -61,58 +57,14 @@ def visual_handoff(script, scene_id):
                                                 if line.startswith('- ')]))
 
 
-# A legacy Slicer wrote this descriptive authoring stamp into creative prose.
-# Only this exact leading stamp is metadata; never strip arbitrary hashes or
-# explicit requirements elsewhere in approved content.
-_AUTHORING_STAMP = re.compile(
-    r"^\s*Hợp đồng phiên bản\s+(?P<version>\d+\.\d+\.\d+)\s*,\s*"
-    r"SHA-256\s+(?P<sha256>[0-9a-fA-F]{64})\.\s*")
-
-
-def bind_execution_contract(handoff, bundle):
-    """Project legacy authoring metadata without changing approved content."""
-    if handoff is None:
-        return None
-    from src.scene_design import system_contract as system
-    system.verify(bundle)
-    result=copy.deepcopy(handoff)
-    binding=result.get('contract_binding')
-    if binding is not None:
-        # A projection belongs to one job snapshot. Reusing it under a different
-        # snapshot is still a real mismatch; fresh jobs start from approved source.
-        system.assert_reference(binding,bundle)
-        return result
-    continuity=result.get('global_visuals',{}).get('continuity','')
-    stamp=_AUTHORING_STAMP.match(continuity)
-    if stamp:
-        result['global_visuals']['continuity']=continuity[stamp.end():]
-        result['contract_binding']=dict(
-            **system.reference(bundle),policy='job_snapshot_authoritative',
-            script_authoring_reference=dict(contract_version=stamp['version'],
-                contract_sha256=stamp['sha256'].lower()),
-            source_field='script.global_visuals.continuity',
-            scope='Only the leading authoring stamp is provenance; all remaining approved requirements are unchanged')
-    return result
-
-
 def with_visual_handoff(context):
     script = context.get('script') or {}
     if 'global_visuals' in script:
         handoff=visual_handoff(script,context['scene']['scene_id'])
-        existing=context.get('visual_handoff') or {}
-        if 'contract_binding' in existing and not _AUTHORING_STAMP.match(script['global_visuals']['continuity']):
-            handoff['contract_binding']=copy.deepcopy(existing['contract_binding'])
     else:
         handoff=context.get('visual_handoff')
     if handoff is None:
         return context
-    bundle=context.get('system_contract')
-    if bundle:
-        handoff=bind_execution_contract(handoff,bundle)
-        if 'global_visuals' in script and handoff['global_visuals']!=script['global_visuals']:
-            script=copy.deepcopy(script)
-            script['global_visuals']=copy.deepcopy(handoff['global_visuals'])
-            return dict(context,script=script,visual_handoff=handoff)
     return dict(context,visual_handoff=handoff)
 
 

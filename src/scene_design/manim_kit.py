@@ -162,21 +162,8 @@ def track(scene, object_id, mobject, role='shape', overlap_with=(), *, kind=None
         scene.layout_registry = {}
     if object_id in scene.layout_registry:
         raise ValueError('Duplicate tracked object: '+object_id)
-    bundle = getattr(scene, 'system_contract', None)
     actual_kind = kind if kind is not None else role
-    if bundle:
-        expected = next((o for o in scene.layout_plan['objects'] if o['id'] == object_id), None)
-        if expected is None or kind is None or layout_role is None:
-            raise ValueError('Contract V3 requires a planned ID, explicit kind and layout_role')
-        if actual_kind != expected['kind'] or layout_role != expected['layout_role']:
-            raise ValueError('Tracked metadata differs from the validated visual plan')
-        if overlap_with:
-            raise ValueError('V3 overlap permission comes only from plan intervals')
-        points = {id(p) for p in mobject.get_family() if p.has_points()}
-        for entry in scene.layout_registry.values():
-            if points & {id(p) for p in entry['mobject'].get_family() if p.has_points()}:
-                raise ValueError('Do not track the same parent/child geometry twice')
-    elif actual_kind not in ('text', 'formula', 'shape', 'background'):
+    if actual_kind not in ('text','formula','shape','background'):
         raise ValueError('Unknown tracked object kind')
     scene.layout_registry[object_id] = dict(mobject=mobject, role=actual_kind,
         kind=actual_kind, layout_role=layout_role, overlap_with=list(overlap_with))

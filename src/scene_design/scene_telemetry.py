@@ -13,7 +13,6 @@ class LayoutTelemetry:
         self.candidates, self.candidate_seen = [], set()
         self.seen = set()
         self.object_ids = set()
-        self.rigid_part_ids = {}
         self.previous = None
         self.early_motion = False
         self.active_motion = None
@@ -21,15 +20,7 @@ class LayoutTelemetry:
         self.active_fonts = {}
         self.content_transforms = set()
         self.content_labels = {}
-        self.bundle=getattr(scene,'system_contract',None)
-        self.plan=getattr(scene,'layout_plan',None)
-        self.frame_profile=profile(self.bundle)
-        self.contract_audit=None
-        if self.bundle:
-            from src.scene_design.contract_layout import ContractLayoutAudit
-            from src.scene_design import system_contract as system
-            system.assert_reference(self.plan,self.bundle)
-            self.contract_audit=ContractLayoutAudit(self,self.bundle,self.plan)
+        self.frame_profile=profile()
 
     @staticmethod
     def pose(mob):
@@ -45,7 +36,7 @@ class LayoutTelemetry:
                    for part in entry['mobject'].get_family()}
         # Unregistered text still participates in readability/collision checks.
         for mob in self.scene.get_mobject_family_members():
-            if (isinstance(mob,(Text,MathTex,Tex)) or self.bundle and mob.has_points()) and not isinstance(mob,ValueTracker) and id(mob) not in covered:
+            if isinstance(mob,(Text,MathTex,Tex)) and not isinstance(mob,ValueTracker) and id(mob) not in covered:
                 oid = 'untracked_'+str(id(mob))
                 registry[oid] = dict(mobject=mob, role='text' if isinstance(mob,(Text,MathTex,Tex)) else 'shape', overlap_with=[])
                 covered.update(id(part) for part in mob.get_family())
@@ -78,34 +69,6 @@ class LayoutTelemetry:
                 raise ValueError('Nonfinite render geometry: '+oid)
             result[oid] = dict(role=entry['role'], box=[round(v,5) for v in box],
                                overlap_with=entry['overlap_with'])
-            if self.bundle:
-                result[oid].update(kind=entry.get('kind',entry['role']),layout_role=entry.get('layout_role'),
-                    center=[round((box[0]+box[1])/2,5),round((box[2]+box[3])/2,5)],
-                    content_transform=id(mob) in self.content_transforms,
-                    draw_order=[float(getattr(mob,'z_index',0)),order.get(id(mob),0)])
-                signatures=[]; rigid_parts={}
-                identifiers=self.rigid_part_ids.setdefault(oid,{})
-                for part in family:
-                    points=np.asarray(part.points)[:,:2]
-                    if len(points):
-                        centered=points-points.mean(axis=0)
-                        inertia=float((centered**2).sum())
-                        area=float(abs(np.sum(points[:,0]*np.roll(points[:,1],-1)-points[:,1]*np.roll(points[:,0],-1))/2))
-                        signatures.extend((len(points),inertia,area))
-                        # Filled point-bearing leaves represent visible material.
-                        # Stroke-only grid/seam lines are decoration, not rigid pieces.
-                        if (entry.get('kind',entry['role'])=='shape' and isinstance(part,VMobject)
-                                and float(np.max(part.get_fill_opacity()))>=.15 and area>1e-8):
-                            key=identifiers.setdefault(id(part),f'part_{len(identifiers)+1:03d}')
-                            rigid_parts[key]=dict(point_count=len(points),inertia=inertia,area=area)
-                result[oid]['rigid_signature']=signatures
-                if entry.get('kind',entry['role'])=='shape':
-                    result[oid]['rigid_parts']=rigid_parts
-                all_points=np.concatenate([np.asarray(p.points)[:,:2] for p in family if len(p.points)])
-                result[oid]['pose_signature']=(all_points-all_points.mean(axis=0))[:6].flatten().tolist()
-                vertices=mob.get_vertices() if isinstance(mob,Rectangle) else []
-                axis_aligned=bool(len(vertices)==4 and all(abs(a[0]-b[0])<1e-6 or abs(a[1]-b[1])<1e-6 for a,b in zip(vertices,np.roll(vertices,1,axis=0))))
-                result[oid]['opaque_rectangle']=bool(axis_aligned and float(mob.get_fill_opacity())>=.99)
             result[oid]['style'] = [dict(fill=np.asarray(p.get_fill_rgbas()).round(5).tolist(),
                 stroke=np.asarray(p.get_stroke_rgbas()).round(5).tolist(),
                 stroke_width=np.asarray(p.get_stroke_width()).round(5).tolist())
@@ -155,47 +118,44 @@ class LayoutTelemetry:
                     self.samples.append(row)
         if not objects and self.frame == 0:
             issue([], 'First encoded frame has no visible tracked content', 'Show a visual anchor at t=0', 'timing')
-        if self.contract_audit:
-            self.contract_audit.capture(objects,self.frame,count)
-        else:
-            for oid, item in objects.items():
-                if item['role']=='background':
+        for oid, item in objects.items():
+            if item['role']=='background':
+                continue
+            a = item['box']
+            if a[0]<bounds[0]-.02 or a[1]>bounds[1]+.02 or a[2]<bounds[2]-.02 or a[3]>bounds[3]+.02:
+                issue([oid], 'Rendered object leaves the safe area', 'Adjust shift/scale/path; split the plan if minimum readable text cannot fit')
+            if item.get('font_size',100) < profile()['min_font_size']-.1:
+                issue([oid], 'Rendered font is below the readability minimum',
+                      f'Measured font_size={item["font_size"]}; minimum={profile()["min_font_size"]}. '
+                      'Use vn_text(content, size=28) and remove undersizing scale factors; wrap or split only if needed.')
+        def candidate(ids, problem):
+            key=(tuple(ids),problem)
+            if key not in self.candidate_seen and len(self.candidates)<40:
+                self.candidate_seen.add(key)
+                self.candidates.append(dict(time=row['time'],object_ids=ids,problem=problem,
+                    bbox_only=True))
+        foreground=[(oid,item) for oid,item in objects.items() if item['role']!='background']
+        for oid,item in foreground:
+            a=item['box']
+            if min(a[0]-bounds[0],bounds[1]-a[1],a[2]-bounds[2],bounds[3]-a[3])<.12:
+                candidate([oid],'Rendered object is close to a safe-area edge')
+        for i,(aid,a) in enumerate(foreground):
+            for bid,b in foreground[i+1:]:
+                if a['role'] in ('text','formula') and b['role'] in ('text','formula'):
                     continue
-                a = item['box']
-                if a[0]<bounds[0]-.02 or a[1]>bounds[1]+.02 or a[2]<bounds[2]-.02 or a[3]>bounds[3]+.02:
-                    issue([oid], 'Rendered object leaves the safe area', 'Adjust shift/scale/path; split the plan if minimum readable text cannot fit')
-                if item.get('font_size',100) < profile()['min_font_size']-.1:
-                    issue([oid], 'Rendered font is below the readability minimum',
-                          f'Measured font_size={item["font_size"]}; minimum={profile()["min_font_size"]}. '
-                          'Use vn_text(content, size=28) and remove undersizing scale factors; wrap or split only if needed.')
-            def candidate(ids, problem):
-                key=(tuple(ids),problem)
-                if key not in self.candidate_seen and len(self.candidates)<40:
-                    self.candidate_seen.add(key)
-                    self.candidates.append(dict(time=row['time'],object_ids=ids,problem=problem,
-                        bbox_only=True))
-            foreground=[(oid,item) for oid,item in objects.items() if item['role']!='background']
-            for oid,item in foreground:
-                a=item['box']
-                if min(a[0]-bounds[0],bounds[1]-a[1],a[2]-bounds[2],bounds[3]-a[3])<.12:
-                    candidate([oid],'Rendered object is close to a safe-area edge')
-            for i,(aid,a) in enumerate(foreground):
-                for bid,b in foreground[i+1:]:
-                    if a['role'] in ('text','formula') and b['role'] in ('text','formula'):
-                        continue
-                    if bid in a['overlap_with'] or aid in b['overlap_with']:
-                        continue
-                    x,y=a['box'],b['box']
-                    if min(x[1],y[1])-max(x[0],y[0])>.02 and min(x[3],y[3])-max(x[2],y[2])>.02:
-                        candidate([aid,bid],'Possible rendered geometry overlap; inspect actual visible paths')
-            labels = [(oid,item) for oid,item in objects.items() if item['role'] in ('text','formula')]
-            for i,(aid,a) in enumerate(labels):
-                for bid,b in labels[i+1:]:
-                    if bid in a['overlap_with'] or aid in b['overlap_with']:
-                        continue
-                    x,y=a['box'],b['box']
-                    if min(x[1],y[1])-max(x[0],y[0])>.02 and min(x[3],y[3])-max(x[2],y[2])>.02:
-                        issue([aid,bid], 'Rendered text bounding boxes overlap', 'Change buff/shift/visibility or motion timing')
+                if bid in a['overlap_with'] or aid in b['overlap_with']:
+                    continue
+                x,y=a['box'],b['box']
+                if min(x[1],y[1])-max(x[0],y[0])>.02 and min(x[3],y[3])-max(x[2],y[2])>.02:
+                    candidate([aid,bid],'Possible rendered geometry overlap; inspect actual visible paths')
+        labels = [(oid,item) for oid,item in objects.items() if item['role'] in ('text','formula')]
+        for i,(aid,a) in enumerate(labels):
+            for bid,b in labels[i+1:]:
+                if bid in a['overlap_with'] or aid in b['overlap_with']:
+                    continue
+                x,y=a['box'],b['box']
+                if min(x[1],y[1])-max(x[0],y[0])>.02 and min(x[3],y[3])-max(x[2],y[2])>.02:
+                    issue([aid,bid], 'Rendered text bounding boxes overlap', 'Change buff/shift/visibility or motion timing')
         geometry = {k:v['box'] for k,v in objects.items() if v['role']!='background'}
         if self.previous is not None and self.frame/self.fps<=.8 and geometry!=self.previous:
             self.early_motion = True
@@ -240,13 +200,6 @@ class LayoutTelemetry:
                 if builder:target=getattr(mob,'target',None)
                 if not builder and target is not None and hasattr(target,'text') and self.content_labels.get(id(mob),getattr(mob,'text',None))!=target.text:
                     entry['target_text']=str(target.text)[:300]
-                if (self.contract_audit and mob is not None and target is not None
-                        and not builder and hasattr(target,'text') and self.content_labels.get(id(mob),getattr(mob,'text',None))!=target.text):
-                    for oid in ids:
-                        if registry[oid].get('layout_role')=='hud':
-                            self.content_transforms.add(id(mob))
-                            self.contract_audit.check_content_target(oid,target,start/self.fps)
-                            content_targets.append((oid,mob,target,animation))
                 # Text.font_size is derived from its construction-time glyph height.
                 # Transform changes glyphs without refreshing that baseline. Calibrate
                 # telemetry against the target so 28pt text morphing to '1' stays 28pt;
@@ -270,15 +223,6 @@ class LayoutTelemetry:
                 self.active_motion=None
                 self.active_fonts={}
                 self.content_transforms.clear()
-                for oid,mob,target,animation in content_targets:
-                    # Transform intentionally keeps the source Text.text attribute.
-                    # Reset the pose to the completed target, not the stale label.
-                    expected=self.pose(getattr(animation,'target_copy',target))
-                    if self.contract_audit._changed(self.pose(mob),expected):
-                        self.contract_audit.issue('HUD_TRANSFORM',[oid],self.frame/self.fps,
-                            'Completed content geometry differs from its verified target','layout_policy.hud')
-                    self.contract_audit.hud_poses[oid]=expected
-                    self.content_labels[id(mob)]=target.text
                 for mob,size in font_targets:
                     raw=float(mob.font_size)
                     if raw>0:self.font_corrections[id(mob)]=size/raw
@@ -287,15 +231,11 @@ class LayoutTelemetry:
                 animations=animations,is_wait=bool(animations) and all(a['type']=='Wait' for a in animations),
                 motion={oid:stat for oid,stat in motion.items() if oid in affected or stat['changed_frames']})
             self.events.append(event)
-            if self.contract_audit:
-                self.contract_audit.event(event)
             return value
         self.scene.play = play
 
     def report(self):
-        from src.scene_design import system_contract as system
-        return dict(**(system.reference(self.bundle) if self.bundle else {}),
-                    checked_frames=self.frame, fps=self.fps, events=self.events,
+        return dict(checked_frames=self.frame, fps=self.fps, events=self.events,
                     object_ids=sorted(self.object_ids), issues=self.issues,candidates=self.candidates,
                     early_motion=self.early_motion, samples=self.samples, semantic_states=self.semantic_states)
 
